@@ -24,71 +24,132 @@ import cv2
 import numpy as np
 import robotica
 
+
+VEL_AVANCE = 1.4
+VEL_GIRO_MAX = 1.2
+K_GIRO = 1.5
+AREA_MINIMA = 500
+
+
 def procesar_mascara(img):
-    """Convierte a HSV y aplica el doble umbral para el color rojo."""
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    
-    # Rangos del rojo
-    rango_bajo1 = np.array([0, 100, 20])
-    rango_alto1 = np.array([10, 255, 255])
-    rango_bajo2 = np.array([160, 100, 20])
-    rango_alto2 = np.array([180, 255, 255])
-    
-    mask1 = cv2.inRange(hsv, rango_bajo1, rango_alto1)
-    mask2 = cv2.inRange(hsv, rango_bajo2, rango_alto2)
-    
-    return cv2.addWeighted(mask1, 1.0, mask2, 1.0, 0)
+
+    rojo_bajo1 = np.array([0, 100, 20])
+    rojo_alto1 = np.array([10, 255, 255])
+
+    rojo_bajo2 = np.array([160, 100, 20])
+    rojo_alto2 = np.array([180, 255, 255])
+
+    mask1 = cv2.inRange(hsv, rojo_bajo1, rojo_alto1)
+    mask2 = cv2.inRange(hsv, rojo_bajo2, rojo_alto2)
+
+    return mask1 + mask2
+
 
 def obtener_centro(mask):
-    contornos, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    for c in contornos:
-        if cv2.contourArea(c) > 500:
-            M = cv2.moments(c)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                return cx, cy, c
-    return None, None, None
+    contornos, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
 
-def dibujar_info(mask, cx, cy):
-    cv2.circle(mask, (cx, cy), 10, (150), 2)
-    cv2.line(mask, (cx - 15, cy), (cx + 15, cy), (150), 2)
-    cv2.line(mask, (cx, cy - 15), (cx, cy + 15), (150), 2)
-    
-    cv2.putText(mask, f"Centro: {cx}, {cy}", (cx + 20, cy - 20), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255), 1)
-    return mask
+    if len(contornos) == 0:
+        return None, 0
+
+    contorno = max(contornos, key=cv2.contourArea)
+    area = cv2.contourArea(contorno)
+
+    if area < AREA_MINIMA:
+        return None, area
+
+    M = cv2.moments(contorno)
+
+    if M["m00"] == 0:
+        return None, area
+
+    cx = int(M["m10"] / M["m00"])
+    return cx, area
+
+
+def limitar(valor, minimo, maximo):
+    return max(min(valor, maximo), minimo)
+
 
 def main():
     coppelia = robotica.Coppelia()
-    robot = robotica.P3DX(coppelia.sim, 'PioneerP3DX', True)
+    robot = robotica.P3DX(coppelia.sim, "PioneerP3DX", True)
+
     coppelia.start_simulation()
-    
-    print("Sistema listo. Presiona 'q' en la ventana de imagen para salir.")
+
+    print("Programa iniciado. Pulsa q para salir.")
 
     try:
         while coppelia.is_running():
             img = robot.get_image()
+
             if img is None:
                 continue
 
-            mascara = procesar_mascara(img)
-            
-            cx, cy, contorno_valido = obtener_centro(mascara)
-            
-            if cx is not None:
-                mascara = dibujar_info(mascara, cx, cy)
-                print(f"Bola detectada -> X: {cx}, Y: {cy}")
-            
-            cv2.imshow('Seguimiento de Bola (Mascara)', mascara)
+            alto, ancho, _ = img.shape
+            centro_img = ancho / 2
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            mask = procesar_mascara(img)
+            cx, area = obtener_centro(mask)
+
+            if cx is None:
+                # Si no ve la bola, gira despacio buscándola
+                v_izq = 0.4
+                v_der = -0.4
+                estado = "BUSCANDO BOLA"
+
+            else:
+                error = (cx - centro_img) / centro_img
+
+                giro = K_GIRO * error
+                giro = limitar(giro, -VEL_GIRO_MAX, VEL_GIRO_MAX)
+
+                # Si la bola está muy descentrada, primero solo gira
+                if abs(error) > 0.35:
+                    avance = 0.0
+                else:
+                    avance = VEL_AVANCE
+
+                # Si la bola está muy cerca, parar
+                if area > 30000:
+                    avance = 0.0
+
+                v_izq = avance + giro
+                v_der = avance - giro
+
+                estado = f"SIGUIENDO BOLA | error={error:.2f}, area={area:.0f}"
+
+                cv2.circle(mask, (cx, alto // 2), 10, 255, 2)
+                cv2.line(mask, (int(centro_img), 0), (int(centro_img), alto), 255, 1)
+
+            robot.set_speed(v_izq, v_der)
+
+            cv2.putText(
+                mask,
+                estado,
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                255,
+                2
+            )
+
+            cv2.imshow("Mascara bola roja", mask)
+
+            print(f"{estado} | v_izq={v_izq:.2f}, v_der={v_der:.2f}")
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
-                
+
     finally:
+        robot.set_speed(0, 0)
         coppelia.stop_simulation()
         cv2.destroyAllWindows()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
