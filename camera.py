@@ -4,48 +4,35 @@ import robotica
 import time
 
 
-VEL_AVANCE_MAX = 2.15
-VEL_AVANCE_BUSQUEDA = 0.75
-VEL_GIRO_MAX = 1.45
+VEL_AVANCE_MAX = 2.0
+VEL_GIRO_MAX = 1.2
 
-K_P = 2.45
-K_D = 0.28
+K_P = 2.2
+K_D = 0.35
 
-AREA_MINIMA = 450
-AREA_BOLA_CERCA = 36000
+AREA_MINIMA = 500
+AREA_BOLA_CERCA = 30000
 
-ALPHA_ERROR = 0.35
-ALPHA_DERIVADA = 0.18
+ALPHA_ERROR = 0.25
+ALPHA_DERIVADA = 0.2
 
-TIEMPO_MEMORIA_CORTA = 1.8
+TIEMPO_MEMORIA_CORTA = 2.0
 TIEMPO_BUSQUEDA_LARGA = 5.0
 
-VEL_BUSQUEDA_GIRO = 0.55
-VEL_BUSQUEDA_AVANCE = 0.65
+VEL_BUSQUEDA_GIRO = 0.5
+VEL_BUSQUEDA_AVANCE = 0.5
 
-DIST_PRECAUCION_FRONTAL = 0.70
-DIST_PRECAUCION_LATERAL = 0.48
-DIST_CRITICA_FRONTAL = 0.24
-DIST_CRITICA_LATERAL = 0.18
-
-K_EVITA_FRONTAL = 1.55
-K_EVITA_LATERAL = 1.10
-
-REDUCCION_FRONTAL = 0.88
-REDUCCION_LATERAL = 0.38
-
-ALPHA_SONAR = 0.45
-
-MAX_CAMBIO_VEL = 0.18
-MAX_CAMBIO_GIRO = 0.22
+DIST_OBSTACULO_FRONTAL = 0.35
+DIST_OBSTACULO_LATERAL = 0.25
 
 
 def procesar_mascara(img):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-    rojo_bajo1 = np.array([0, 95, 25])
-    rojo_alto1 = np.array([12, 255, 255])
-    rojo_bajo2 = np.array([158, 95, 25])
+    rojo_bajo1 = np.array([0, 100, 20])
+    rojo_alto1 = np.array([10, 255, 255])
+
+    rojo_bajo2 = np.array([160, 100, 20])
     rojo_alto2 = np.array([180, 255, 255])
 
     mask1 = cv2.inRange(hsv, rojo_bajo1, rojo_alto1)
@@ -61,38 +48,21 @@ def procesar_mascara(img):
 
 def obtener_centro(mask):
     contornos, _ = cv2.findContours(
-        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
     )
 
     if len(contornos) == 0:
         return None, 0
 
-    mejor_contorno = None
-    mejor_puntuacion = 0
+    contorno = max(contornos, key=cv2.contourArea)
+    area = cv2.contourArea(contorno)
 
-    for contorno in contornos:
-        area = cv2.contourArea(contorno)
+    if area < AREA_MINIMA:
+        return None, area
 
-        if area < AREA_MINIMA:
-            continue
-
-        perimetro = cv2.arcLength(contorno, True)
-
-        if perimetro <= 0:
-            continue
-
-        circularidad = 4.0 * np.pi * area / (perimetro * perimetro)
-        puntuacion = area * max(0.35, min(circularidad, 1.0))
-
-        if puntuacion > mejor_puntuacion:
-            mejor_puntuacion = puntuacion
-            mejor_contorno = contorno
-
-    if mejor_contorno is None:
-        return None, 0
-
-    area = cv2.contourArea(mejor_contorno)
-    M = cv2.moments(mejor_contorno)
+    M = cv2.moments(contorno)
 
     if M["m00"] == 0:
         return None, area
@@ -106,18 +76,9 @@ def limitar(valor, minimo, maximo):
     return max(min(valor, maximo), minimo)
 
 
-def acercar_suave(actual, objetivo, max_cambio):
-    if objetivo > actual + max_cambio:
-        return actual + max_cambio
-
-    if objetivo < actual - max_cambio:
-        return actual - max_cambio
-
-    return objetivo
-
-
 def leer_zonas_sonar(robot):
     sonar = robot.get_sonar()
+
     izquierda = min(sonar[0], sonar[1], sonar[2])
     frente = min(sonar[3], sonar[4])
     derecha = min(sonar[5], sonar[6], sonar[7])
@@ -125,102 +86,29 @@ def leer_zonas_sonar(robot):
     return izquierda, frente, derecha
 
 
-def filtrar_sonar(zonas_filtradas, zonas_nuevas):
-    if zonas_filtradas is None:
-        return zonas_nuevas
+def comportamiento_evitar_obstaculos(robot):
+    izquierda, frente, derecha = leer_zonas_sonar(robot)
 
-    izq_ant, frente_ant, der_ant = zonas_filtradas
-    izq, frente, der = zonas_nuevas
+    obstaculo_frente = frente < DIST_OBSTACULO_FRONTAL
+    obstaculo_izquierda = izquierda < DIST_OBSTACULO_LATERAL
+    obstaculo_derecha = derecha < DIST_OBSTACULO_LATERAL
 
-    izquierda = ALPHA_SONAR * izq + (1 - ALPHA_SONAR) * izq_ant
-    frente = ALPHA_SONAR * frente + (1 - ALPHA_SONAR) * frente_ant
-    derecha = ALPHA_SONAR * der + (1 - ALPHA_SONAR) * der_ant
+    if not obstaculo_frente and not obstaculo_izquierda and not obstaculo_derecha:
+        return None
 
-    return izquierda, frente, derecha
-
-
-def riesgo_por_distancia(distancia, distancia_precaucion, distancia_critica):
-    if distancia >= distancia_precaucion:
-        return 0.0
-
-    if distancia <= distancia_critica:
-        return 1.0
-
-    return (
-        distancia_precaucion - distancia
-    ) / (
-        distancia_precaucion - distancia_critica
-    )
-
-
-def calcular_evitacion(zonas_sonar):
-    izquierda, frente, derecha = zonas_sonar
-
-    riesgo_izq = riesgo_por_distancia(
-        izquierda, DIST_PRECAUCION_LATERAL, DIST_CRITICA_LATERAL
-    )
-    riesgo_frente = riesgo_por_distancia(
-        frente, DIST_PRECAUCION_FRONTAL, DIST_CRITICA_FRONTAL
-    )
-    riesgo_der = riesgo_por_distancia(
-        derecha, DIST_PRECAUCION_LATERAL, DIST_CRITICA_LATERAL
-    )
-
-    giro_lateral = K_EVITA_LATERAL * (riesgo_izq - riesgo_der)
-
-    if riesgo_frente > 0:
+    if obstaculo_frente:
         if izquierda > derecha:
-            direccion_libre = -1.0
+            return -0.4, 0.8
         else:
-            direccion_libre = 1.0
-    else:
-        direccion_libre = 0.0
+            return 0.8, -0.4
 
-    giro_frontal = K_EVITA_FRONTAL * riesgo_frente * direccion_libre
-    giro_evitacion = giro_lateral + giro_frontal
-    giro_evitacion = limitar(giro_evitacion, -VEL_GIRO_MAX, VEL_GIRO_MAX)
+    if obstaculo_izquierda:
+        return 0.8, 0.2
 
-    factor_avance = 1.0
-    factor_avance -= REDUCCION_FRONTAL * riesgo_frente
-    factor_avance -= REDUCCION_LATERAL * max(riesgo_izq, riesgo_der)
-    factor_avance = limitar(factor_avance, 0.18, 1.0)
+    if obstaculo_derecha:
+        return 0.2, 0.8
 
-    obstaculo_critico = (
-        frente <= DIST_CRITICA_FRONTAL
-        or izquierda <= DIST_CRITICA_LATERAL
-        or derecha <= DIST_CRITICA_LATERAL
-    )
-
-    if obstaculo_critico and frente <= DIST_CRITICA_FRONTAL:
-        factor_avance = 0.0
-
-        if izquierda > derecha:
-            giro_evitacion = -VEL_GIRO_MAX
-        else:
-            giro_evitacion = VEL_GIRO_MAX
-
-    return giro_evitacion, factor_avance, obstaculo_critico
-
-
-def combinar_seguimiento_y_evitacion(avance_base, giro_base, zonas_sonar):
-    giro_evitacion, factor_avance, obstaculo_critico = calcular_evitacion(
-        zonas_sonar
-    )
-
-    avance = avance_base * factor_avance
-    giro = giro_base + giro_evitacion
-    giro = limitar(giro, -VEL_GIRO_MAX, VEL_GIRO_MAX)
-
-    if obstaculo_critico:
-        giro = giro_evitacion
-
-    v_izq = avance + giro
-    v_der = avance - giro
-
-    v_izq = limitar(v_izq, -VEL_GIRO_MAX, VEL_AVANCE_MAX)
-    v_der = limitar(v_der, -VEL_GIRO_MAX, VEL_AVANCE_MAX)
-
-    return v_izq, v_der, giro_evitacion, factor_avance, obstaculo_critico
+    return None
 
 
 def main():
@@ -228,20 +116,18 @@ def main():
     robot = robotica.P3DX(coppelia.sim, "PioneerP3DX", True)
 
     coppelia.start_simulation()
+
     print("Pulsa q para salir")
 
     error_anterior = 0.0
     error_filtrado = 0.0
     derivada_filtrada = 0.0
+
     tiempo_anterior = time.time()
 
     ultima_direccion = 0
     ultimo_tiempo_vista = time.time()
     ultimo_error_visto = 0.0
-    zonas_sonar_filtradas = None
-
-    v_izq_actual = 0.0
-    v_der_actual = 0.0
 
     try:
         while coppelia.is_running():
@@ -262,172 +148,142 @@ def main():
             if dt <= 0:
                 dt = 1e-6
 
-            zonas_sonar = leer_zonas_sonar(robot)
-            zonas_sonar_filtradas = filtrar_sonar(
-                zonas_sonar_filtradas, zonas_sonar
-            )
-            izquierda, frente, derecha = zonas_sonar_filtradas
-
             if cx is not None:
                 error = (cx - centro_img) / centro_img
+
                 error_filtrado = (
                     ALPHA_ERROR * error
                     + (1 - ALPHA_ERROR) * error_filtrado
                 )
 
-                derivada = (error_filtrado - error_anterior) / dt
+                derivada = (
+                    error_filtrado - error_anterior
+                ) / dt
+
                 derivada_filtrada = (
                     ALPHA_DERIVADA * derivada
                     + (1 - ALPHA_DERIVADA) * derivada_filtrada
                 )
 
-                giro_base = K_P * error_filtrado + K_D * derivada_filtrada
-                giro_base = limitar(giro_base, -VEL_GIRO_MAX, VEL_GIRO_MAX)
-
-                avance_base = VEL_AVANCE_MAX * (
-                    1.0 - 0.58 * min(abs(error_filtrado), 1.0)
+                giro = (
+                    K_P * error_filtrado
+                    + K_D * derivada_filtrada
                 )
-                avance_base = limitar(avance_base, 0.42, VEL_AVANCE_MAX)
+
+                giro = limitar(
+                    giro,
+                    -VEL_GIRO_MAX,
+                    VEL_GIRO_MAX
+                )
+
+                avance = (
+                    VEL_AVANCE_MAX
+                    * (1 - min(abs(error_filtrado), 1))
+                )
 
                 if area > AREA_BOLA_CERCA:
-                    avance_base = 0.0
+                    avance = 0.0
 
-                (
-                    v_izq_objetivo,
-                    v_der_objetivo,
-                    giro_evitacion,
-                    factor_avance,
-                    obstaculo_critico,
-                ) = combinar_seguimiento_y_evitacion(
-                    avance_base, giro_base, zonas_sonar_filtradas
-                )
+                v_izq = avance + giro
+                v_der = avance - giro
 
                 ultimo_tiempo_vista = tiempo_actual
                 ultimo_error_visto = error_filtrado
 
-                if error_filtrado > 0.12:
+                if error_filtrado > 0.15:
                     ultima_direccion = 1
-                elif error_filtrado < -0.12:
+                elif error_filtrado < -0.15:
                     ultima_direccion = -1
                 else:
                     ultima_direccion = 0
 
                 error_anterior = error_filtrado
 
-                if obstaculo_critico:
-                    estado = (
-                        f"SIGUIENDO+EVITANDO CRITICO | "
-                        f"err={error_filtrado:.2f} area={area:.0f}"
-                    )
-                elif abs(giro_evitacion) > 0.08 or factor_avance < 0.95:
-                    estado = (
-                        f"SIGUIENDO+EVITANDO | "
-                        f"err={error_filtrado:.2f} area={area:.0f}"
-                    )
-                else:
-                    estado = (
-                        f"SIGUIENDO | "
-                        f"err={error_filtrado:.2f} area={area:.0f}"
-                    )
+                estado = (
+                    f"SIGUIENDO | error={error_filtrado:.2f} "
+                    f"area={area:.0f}"
+                )
 
-                cv2.circle(mask, (cx, alto // 2), 10, 255, 2)
+                cv2.circle(
+                    mask,
+                    (cx, alto // 2),
+                    10,
+                    255,
+                    2
+                )
+
                 cv2.line(
-                    mask, (int(centro_img), 0),
-                    (int(centro_img), alto), 255, 1
+                    mask,
+                    (int(centro_img), 0),
+                    (int(centro_img), alto),
+                    255,
+                    1
                 )
 
             else:
                 tiempo_sin_ver = tiempo_actual - ultimo_tiempo_vista
 
-                if tiempo_sin_ver < TIEMPO_MEMORIA_CORTA:
+                velocidades_evitacion = comportamiento_evitar_obstaculos(robot)
+
+                if velocidades_evitacion is not None:
+                    v_izq, v_der = velocidades_evitacion
+                    estado = "EVITANDO OBSTACULO"
+
+                elif tiempo_sin_ver < TIEMPO_MEMORIA_CORTA:
                     if ultima_direccion > 0:
-                        avance_base = VEL_BUSQUEDA_AVANCE * 0.70
-                        giro_base = VEL_BUSQUEDA_GIRO
+                        v_izq = VEL_BUSQUEDA_GIRO
+                        v_der = -VEL_BUSQUEDA_GIRO
                         estado = "PERDIDA RECIENTE | buscando derecha"
 
                     elif ultima_direccion < 0:
-                        avance_base = VEL_BUSQUEDA_AVANCE * 0.70
-                        giro_base = -VEL_BUSQUEDA_GIRO
+                        v_izq = -VEL_BUSQUEDA_GIRO
+                        v_der = VEL_BUSQUEDA_GIRO
                         estado = "PERDIDA RECIENTE | buscando izquierda"
 
                     else:
-                        avance_base = VEL_BUSQUEDA_AVANCE
-                        giro_base = limitar(
-                            0.55 * ultimo_error_visto,
-                            -VEL_BUSQUEDA_GIRO,
-                            VEL_BUSQUEDA_GIRO
-                        )
+                        v_izq = VEL_BUSQUEDA_AVANCE
+                        v_der = VEL_BUSQUEDA_AVANCE
                         estado = "PERDIDA RECIENTE | avanzando"
 
                 elif tiempo_sin_ver < TIEMPO_BUSQUEDA_LARGA:
-                    avance_base = VEL_AVANCE_BUSQUEDA
-
                     if ultima_direccion >= 0:
-                        giro_base = 0.45
+                        v_izq = 0.7
+                        v_der = 0.2
                         estado = "BUSQUEDA MEDIA | derecha"
                     else:
-                        giro_base = -0.45
+                        v_izq = 0.2
+                        v_der = 0.7
                         estado = "BUSQUEDA MEDIA | izquierda"
 
                 else:
-                    avance_base = 0.35
-
                     if ultima_direccion >= 0:
-                        giro_base = 0.95
+                        v_izq = 0.5
+                        v_der = -0.5
                         estado = "BUSQUEDA AMPLIA | derecha"
                     else:
-                        giro_base = -0.95
+                        v_izq = -0.5
+                        v_der = 0.5
                         estado = "BUSQUEDA AMPLIA | izquierda"
 
-                (
-                    v_izq_objetivo,
-                    v_der_objetivo,
-                    giro_evitacion,
-                    factor_avance,
-                    obstaculo_critico,
-                ) = combinar_seguimiento_y_evitacion(
-                    avance_base, giro_base, zonas_sonar_filtradas
-                )
-
-                if obstaculo_critico:
-                    estado = "EVITANDO OBSTACULO CRITICO"
-                elif abs(giro_evitacion) > 0.08 or factor_avance < 0.95:
-                    estado += " + evitando"
-
-            v_izq_actual = acercar_suave(
-                v_izq_actual,
-                v_izq_objetivo,
-                MAX_CAMBIO_VEL
-                + MAX_CAMBIO_GIRO * abs(v_izq_objetivo - v_izq_actual)
-            )
-
-            v_der_actual = acercar_suave(
-                v_der_actual,
-                v_der_objetivo,
-                MAX_CAMBIO_VEL
-                + MAX_CAMBIO_GIRO * abs(v_der_objetivo - v_der_actual)
-            )
-
             tiempo_anterior = tiempo_actual
-            robot.set_speed(v_izq_actual, v_der_actual)
 
-            cv2.putText(
-                mask, estado, (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, 255, 2
-            )
+            robot.set_speed(v_izq, v_der)
 
             cv2.putText(
                 mask,
-                f"S izq={izquierda:.2f} fr={frente:.2f} der={derecha:.2f}",
-                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, 255, 1
+                estado,
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                255,
+                2
             )
 
             cv2.imshow("Mascara", mask)
 
             print(
                 f"{estado} | "
-                f"v_izq={v_izq_actual:.2f}, v_der={v_der_actual:.2f} | "
-                f"sonar=({izquierda:.2f}, {frente:.2f}, {derecha:.2f})"
+                f"v_izq={v_izq:.2f}, v_der={v_der:.2f}"
             )
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
