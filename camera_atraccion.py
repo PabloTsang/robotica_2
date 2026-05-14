@@ -14,17 +14,22 @@ AREA_OBJETIVO = 55000
 # CONTROL PD (GIRO)
 # =========================
 KP = 1.1
-KD = 0.6  # 🔥 clave para eliminar zigzag
+KD = 0.6
 
 # =========================
-# REPULSIÓN
+# SONAR (UMBRAL)
 # =========================
-UMBRAL_REP = 0.5
-K_REP = 0.5
+U_FRONTAL = 0.35
+U_FRONT_LAT = 0.45
+U_LATERAL = 0.5
 
-# mezcla estable (evita peleas)
-W_ATRACCION = 0.8
-W_REPULSION = 0.2
+K_REP = 1.2
+
+# =========================
+# PESOS
+# =========================
+W_ATR = 0.75
+W_REP = 0.25
 
 # =========================
 # MEMORIA
@@ -38,40 +43,67 @@ def procesar_mascara(img):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, (0, 100, 20), (10, 255, 255)) + \
            cv2.inRange(hsv, (160, 100, 20), (180, 255, 255))
+
     kernel = np.ones((5, 5), np.uint8)
-    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask
 
 
 def obtener_centro(mask):
     contornos, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contornos:
         return None, 0
+
     c = max(contornos, key=cv2.contourArea)
     area = cv2.contourArea(c)
+
     if area < 400:
         return None, area
+
     M = cv2.moments(c)
     if M["m00"] == 0:
         return None, area
+
     cx = int(M["m10"] / M["m00"])
     return cx, area
 
 
 def leer_sonar(robot):
     s = robot.get_sonar()
+
     left = min(s[0], s[1], s[2])
+    front_left = s[2]
     front = min(s[3], s[4])
+    front_right = s[4]
     right = min(s[5], s[6], s[7])
-    return left, front, right
+
+    return left, front_left, front, front_right, right
 
 
-def repulsion(left, front, right):
-    lf = max(0.0, UMBRAL_REP - left)
-    rf = max(0.0, UMBRAL_REP - right)
-    ff = max(0.0, UMBRAL_REP - front)
+def repulsion(left, fl, front, fr, right):
+    # fuerzas
+    fL = max(0.0, U_LATERAL - left)
+    fR = max(0.0, U_LATERAL - right)
 
-    giro_rep = K_REP * (rf - lf)
-    return giro_rep
+    fFL = max(0.0, U_FRONT_LAT - fl)
+    fFR = max(0.0, U_FRONT_LAT - fr)
+
+    fF = max(0.0, U_FRONTAL - front)
+
+    # prioridad:
+    # frontal domina totalmente
+    if fF > 0.0:
+        giro = K_REP * (fR - fL)
+        return giro, 0.0
+
+    # frontolateral anticipa giro
+    giro = K_REP * ((fFR + fR) - (fFL + fL))
+
+    # reducción de avance si hay peligro cercano
+    avance_penalty = max(0.0, 1.0 - (fFL + fFR + fL + fR) / 2.0)
+
+    return giro, avance_penalty
 
 
 def limitar(x, a, b):
@@ -102,11 +134,12 @@ def main():
             mask = procesar_mascara(img)
             cx, area = obtener_centro(mask)
 
-            left, front, right = leer_sonar(robot)
-            giro_rep = repulsion(left, front, right)
+            left, fl, front, fr, right = leer_sonar(robot)
+
+            giro_rep, avance_penalty = repulsion(left, fl, front, fr, right)
 
             # =========================
-            # DETECCIÓN / MEMORIA
+            # MEMORIA
             # =========================
             if cx is not None:
                 last_cx = cx
@@ -123,7 +156,7 @@ def main():
                     area_use = 0
 
             # =========================
-            # CONTROL ANGULAR PD
+            # PD VISIÓN
             # =========================
             if cx_use is not None:
                 error = (cx_use - center) / center
@@ -133,18 +166,15 @@ def main():
             deriv = error - prev_error
             prev_error = error
 
-            giro_atraccion = KP * error + KD * deriv
+            giro_atr = KP * error + KD * deriv
 
-            # búsqueda si no ve bola
             if cx_use is None:
-                giro_atraccion = SEARCH_SPEED
+                giro_atr = SEARCH_SPEED
 
             # =========================
-            # COMBINACIÓN ESTABLE
+            # FUSIÓN GIRO
             # =========================
-            giro = (W_ATRACCION * giro_atraccion +
-                    W_REPULSION * giro_rep)
-
+            giro = W_ATR * giro_atr + W_REP * giro_rep
             giro = limitar(giro, -VEL_GIRO_MAX, VEL_GIRO_MAX)
 
             # =========================
@@ -155,18 +185,22 @@ def main():
                     proximity = np.sqrt(area_use / AREA_OBJETIVO)
                     base = VEL_AVANCE_MAX * (1.0 - proximity)
 
-                    alignment_penalty = max(0.2, 1.0 - abs(error))
+                    alignment = max(0.2, 1.0 - abs(error))
 
-                    avance = base * alignment_penalty
+                    avance = base * alignment * avance_penalty
                 else:
                     avance = 0.0
             else:
                 avance = 0.15 * VEL_AVANCE_MAX
 
+            # seguridad frontal dura
+            if front < U_FRONTAL:
+                avance = 0.0
+
             avance = limitar(avance, 0.0, VEL_AVANCE_MAX)
 
             # =========================
-            # ROBOT
+            # CONTROL ROBOT
             # =========================
             v_left = avance + giro
             v_right = avance - giro
@@ -177,6 +211,7 @@ def main():
             # VISUAL
             # =========================
             cv2.circle(img, (int(center), 50), 5, (255, 255, 255), -1)
+
             if cx_use is not None:
                 cv2.circle(img, (int(cx_use), 50), 8, (0, 0, 255), -1)
 
